@@ -47,6 +47,11 @@
 #include "cute/algorithm/gemm.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 
+#include "gpu_trace.h"
+
+GPU_TRACE_SCOPE_DEC(MMA);
+GPU_TRACE_SCOPE_DEC(LOAD_AB);
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::collective {
@@ -60,7 +65,6 @@ template <
   int Stages,
   int SchedulerPipelineStageCount,
   int AccumulatorPipelineStageCount,
-  class ArchTag_,
   class ClusterShape,   // Static cluster shape or dynamic (int, int, _1)
   class TileShape_,     // (MmaAtomShapeM, MmaAtomShapeN, TileK)
   class ElementA_,
@@ -81,8 +85,7 @@ struct CollectiveMma<
       Stages,
       SchedulerPipelineStageCount,
       AccumulatorPipelineStageCount,
-      ClusterShape,
-      ArchTag_>,
+      ClusterShape>,
     TileShape_,
     ElementA_,
     StridePairA_,
@@ -108,8 +111,7 @@ struct CollectiveMma<
                           Stages,
                           SchedulerPipelineStageCount,
                           AccumulatorPipelineStageCount,
-                          ClusterShape,
-                          ArchTag_>;
+                          ClusterShape>;
   using TileShape = TileShape_;
 
   static constexpr bool IsDynamicCluster = not cute::is_static_v<ClusterShape>;
@@ -836,6 +838,8 @@ struct CollectiveMma<
 
     auto barrier_token = mainloop_ab_pipeline.producer_try_acquire(mainloop_ab_pipe_producer_state);
 
+    GET_GPU_TRACE(true);
+
     // Issue the Mainloop loads
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
@@ -849,14 +853,17 @@ struct CollectiveMma<
       ++mainloop_ab_pipe_producer_state;
       barrier_token = mainloop_ab_pipeline.producer_try_acquire(mainloop_ab_pipe_producer_state);
 
+      GPU_TRACE_SCOPE_BEGIN(LOAD_AB);
       if (cute::elect_one_sync()) {
         copy(observed_tma_load_a_->with(get<0>(input_tensormaps), *tma_barrier, mcast_mask_a), tAgA(_,*k_tile_iter), tAsA(_,write_stage));
         copy(observed_tma_load_b_->with(get<1>(input_tensormaps), *tma_barrier, mcast_mask_b), tBgB(_,*k_tile_iter), tBsB(_,write_stage));
       }
+      GPU_TRACE_SCOPE_END(LOAD_AB);
       --k_tile_count;
       ++k_tile_iter;
     }
 
+    RELEASE_GPU_TRACE;
     return cute::make_tuple(mainloop_ab_pipe_producer_state, k_tile_iter);
   }
 
@@ -988,6 +995,8 @@ struct CollectiveMma<
     uint32_t skip_wait = k_tile_count <= 0;
     auto barrier_token = mainloop_pipeline.consumer_try_wait(mainloop_pipe_consumer_state, skip_wait);
 
+    GET_GPU_TRACE(true);
+
     //
     // PIPELINED MAIN LOOP
     //
@@ -1021,6 +1030,8 @@ struct CollectiveMma<
 
         // for each set of scale_k_iter we zero the accumulator
         tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
+
+        GPU_TRACE_SCOPE_BEGIN(MMA);
         // Unroll the K mode manually so we can set scale C to 1
         CUTLASS_PRAGMA_UNROLL
         for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
@@ -1031,6 +1042,8 @@ struct CollectiveMma<
                      acc);
           tiled_mma.accumulate_ = UMMA::ScaleOut::One;
         }
+        GPU_TRACE_SCOPE_END(MMA);
+
         accumulator_pipeline.producer_commit(accumulator_pipe_producer_state);
         ++accumulator_pipe_producer_state;
       }
@@ -1038,6 +1051,7 @@ struct CollectiveMma<
 
     }
 
+    RELEASE_GPU_TRACE;
     return make_tuple(mainloop_pipe_consumer_state, accumulator_pipe_producer_state);
 
   }

@@ -55,6 +55,14 @@
 #include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cute/atom/mma_atom.hpp"
 
+#include "gpu_trace.h"
+
+GPU_TRACE_SCOPE_DEC(LOAD_SF);
+GPU_TRACE_SCOPE_DEC(SCHED);
+GPU_TRACE_SCOPE_DEC(ACCUM);
+GPU_TRACE_SCOPE_DEC(EPI_STORE);
+GPU_TRACE_SCOPE_DEC(EPI_LOAD);
+
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::kernel {
@@ -746,6 +754,8 @@ public:
 
     pipeline_init_wait(cluster_size);
 
+    GPU_TRACE_INIT;
+
     if constexpr (IsGroupedGemmKernel) {
       if (not work_tile_info.is_valid()) {
         // When problem shapes are only on device, the grid launched may be larger than the total number of blocks across groups
@@ -883,6 +893,8 @@ public:
       bool requires_clc_query = true;
       bool did_batch_change = true;
 
+      GET_GPU_TRACE(true);
+
       do {
 
         int32_t curr_batch = idx2crd(work_tile_info.L_idx, size<4>(gA_mkl)); // Usually just returns work_tile_info.L_idx;
@@ -903,6 +915,7 @@ public:
         auto cta_coord_mnk = append<4>(make_coord(get<0>(cta_coord_mnkl), get<1>(cta_coord_mnkl), get<2>(cta_coord_mnkl)), Int<0>{});
 
         // Start mainloop prologue loads, arrive on the epilogue residual load barrier, resume mainloop loads
+        GPU_TRACE_SCOPE_BEGIN(LOAD_SF);
         auto [mainloop_sf_producer_state_next, k_tile_iter_next] = collective_mainloop.load_sf(
           mainloop_sf_pipeline,
           mainloop_sf_pipe_producer_state,
@@ -911,6 +924,7 @@ public:
           k_tile_iter, k_tile_count
         );
         mainloop_sf_pipe_producer_state = mainloop_sf_producer_state_next;
+        GPU_TRACE_SCOPE_END(LOAD_SF);
 
         // Sync warp to prevent non-participating threads entering next wave early
         __syncwarp();
@@ -930,10 +944,11 @@ public:
       } while (work_tile_info.is_valid());
 
       collective_mainloop.load_sf_tail(
-        mainloop_sf_pipeline, 
+        mainloop_sf_pipeline,
         mainloop_sf_pipe_producer_state
       );
-      
+      RELEASE_GPU_TRACE;
+
     }
 
     else if (is_participant.sched) {
@@ -942,6 +957,8 @@ public:
       
       // Signal the epilogue warps to proceed once the prologue is complete
       epilogue_throttle_barrier.arrive();
+
+      GET_GPU_TRACE(true);
 
       // Grouped GEMM uses static tile scheduler
       if constexpr (IsSchedDynamicPersistent) {
@@ -958,9 +975,11 @@ public:
             clc_throttle_pipeline.consumer_wait(clc_pipe_throttle_consumer_state);
             clc_throttle_pipeline.consumer_release(clc_pipe_throttle_consumer_state);
             ++clc_pipe_throttle_consumer_state;
-          
+
             // Query next clcID and update producer state
+            GPU_TRACE_SCOPE_BEGIN(SCHED);
             clc_pipe_producer_state = scheduler.advance_to_next_work(clc_pipeline, clc_pipe_producer_state);
+            GPU_TRACE_SCOPE_END(SCHED);
           }
 
           // Fetch next work tile
@@ -985,17 +1004,21 @@ public:
           work_tile_info = next_work_tile_info;
         } while (work_tile_info.is_valid());
         clc_pipeline.producer_tail(clc_pipe_producer_state);
+        RELEASE_GPU_TRACE;
       }
       else {
         cutlass::arch::wait_on_dependent_grids();
         do {
+          GPU_TRACE_SCOPE_BEGIN(SCHED);
           auto [next_work_tile_info, increment_pipe] = scheduler.advance_to_next_work(clc_pipeline, clc_pipe_producer_state);
+          GPU_TRACE_SCOPE_END(SCHED);
           work_tile_info = next_work_tile_info;
           if (increment_pipe) {
             ++clc_pipe_producer_state;
           }
         } while (work_tile_info.is_valid());
         clc_pipeline.producer_tail(clc_pipe_producer_state);
+        RELEASE_GPU_TRACE;
       }
     }
 
@@ -1104,6 +1127,8 @@ public:
       // Signal the epilogue warps to proceed once the prologue is complete
       epilogue_throttle_barrier.arrive();
 
+      GET_GPU_TRACE(true);
+
       do {
         int32_t curr_batch = work_tile_info.L_idx;
         if (did_batch_change) {
@@ -1138,6 +1163,7 @@ public:
             problem_shape_MNKL = append<4>(problem_shape.get_problem_shape(curr_batch), 1);
           }
           bool reverse_epi_n = IsOverlappingAccum && (current_wave % 2 == 0);
+          GPU_TRACE_SCOPE_BEGIN(EPI_LOAD);
           epi_load_pipe_producer_state = collective_epilogue.template load<IsOverlappingAccum>(
             epi_load_pipeline,
             epi_load_pipe_producer_state,
@@ -1150,6 +1176,7 @@ public:
             cute::make_tuple(epi_load_tensormap, did_batch_change),
             reverse_epi_n
           );
+          GPU_TRACE_SCOPE_END(EPI_LOAD);
 
           do_tail_load = true;
         }
@@ -1170,6 +1197,7 @@ public:
           epi_load_pipeline, epi_load_pipe_producer_state,
           epi_store_pipeline, epi_store_pipe_producer_state);
       }
+      RELEASE_GPU_TRACE;
     }
 
     else if (is_participant.epilogue) {
@@ -1201,6 +1229,8 @@ public:
       auto pipelines = cute::make_tuple(accumulator_pipeline, mainloop_sf_pipeline);
       auto states = cute::make_tuple(accumulator_pipe_consumer_state, mainloop_sf_pipe_consumer_state);
 
+      GET_GPU_TRACE(true);
+
       do {
         int32_t curr_batch = work_tile_info.L_idx;
         if (did_batch_change && warp_idx_in_epi == 0) {
@@ -1228,9 +1258,10 @@ public:
           problem_shape_MNKL = append<4>(problem_shape.get_problem_shape(curr_batch), 1);
         }
 
-        // Get accumulator 
+        // Get accumulator
         auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
 
+        GPU_TRACE_SCOPE_BEGIN(ACCUM);
         auto [accum, tiled_t2r, next_state] = collective_mainloop.accum(
           pipelines,
           states,
@@ -1241,6 +1272,7 @@ public:
           typename CollectiveEpilogue::EpilogueTile{},
           k_tile_count
         );
+        GPU_TRACE_SCOPE_END(ACCUM);
 
         states = next_state;
 
@@ -1251,6 +1283,7 @@ public:
         if (did_batch_change && warp_idx_in_epi == 0) {
           collective_epilogue.template tensormaps_fence_acquire<IsEpiLoad>(epi_store_tensormap);
         }
+        GPU_TRACE_SCOPE_BEGIN(EPI_STORE);
         auto [load_state_next, store_state_next] = collective_epilogue.store(
           epi_load_pipeline,
           epi_load_pipe_consumer_state,
@@ -1266,6 +1299,7 @@ public:
           epi_store_tensormap,
           tiled_t2r // tiled_t2r
         );
+        GPU_TRACE_SCOPE_END(EPI_STORE);
         
         do_tail_store |= TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
 
@@ -1288,6 +1322,7 @@ public:
           epi_store_pipeline, epi_store_pipe_producer_state,
           CtaShape_MNK{});
       }
+      RELEASE_GPU_TRACE;
     }
     else {
       // Register reconfiguration
