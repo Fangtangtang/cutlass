@@ -49,8 +49,9 @@
 
 #include "gpu_trace.h"
 
-GPU_TRACE_SCOPE_DEC(MMA);
-GPU_TRACE_SCOPE_DEC(LOAD_AB);
+GPU_TRACE_SCOPE_DEC(MMA_PRODUCER_STAGE);
+GPU_TRACE_SCOPE_DEC(MMA_CONSUMER_STAGE);
+GPU_TRACE_SCOPE_DEC(SF_LOAD_STAGE);
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -213,7 +214,7 @@ struct CollectiveMma<
   using MainloopSFPipelineState = typename MainloopSFPipeline::PipelineState;
 
   using AccumulatorPipeline = cutlass::PipelineUmmaAsync<
-                                  AccumulatorPipelineStageCount,
+                                  1,
                                   AtomThrShapeMNK>;
   using AccumulatorPipelineState = typename AccumulatorPipeline::PipelineState;
 
@@ -853,12 +854,10 @@ struct CollectiveMma<
       ++mainloop_ab_pipe_producer_state;
       barrier_token = mainloop_ab_pipeline.producer_try_acquire(mainloop_ab_pipe_producer_state);
 
-      GPU_TRACE_SCOPE_BEGIN(LOAD_AB);
       if (cute::elect_one_sync()) {
         copy(observed_tma_load_a_->with(get<0>(input_tensormaps), *tma_barrier, mcast_mask_a), tAgA(_,*k_tile_iter), tAsA(_,write_stage));
         copy(observed_tma_load_b_->with(get<1>(input_tensormaps), *tma_barrier, mcast_mask_b), tBgB(_,*k_tile_iter), tBsB(_,write_stage));
       }
-      GPU_TRACE_SCOPE_END(LOAD_AB);
       --k_tile_count;
       ++k_tile_iter;
     }
@@ -923,10 +922,12 @@ struct CollectiveMma<
     Tensor thr_tile_pSFB = make_tensor<bool>(shape(filter_zeros(thr_tile_SFB_k(_,_,_0{}), tSFBgSFB(_0{},_,_,_0{}).stride())));
 
     // Issue the loads
+    GET_GPU_TRACE(true);
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
       // LOCK pipe_producer_state for _writing_
       mainloop_sf_pipeline.producer_acquire(mainloop_sf_pipe_producer_state);
+      GPU_TRACE_SCOPE_BEGIN_DATA(SF_LOAD_STAGE, mainloop_sf_pipe_producer_state.index());
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(thr_tile_pSFA); ++i) {
@@ -943,6 +944,7 @@ struct CollectiveMma<
       copy_if(scale_copy_a, thr_tile_pSFA, filter_zeros(tSFAgSFA(_,_,_,*k_tile_iter)), filter_zeros(tSFAsSFA(_,_,_,mainloop_sf_pipe_producer_state.index())));
       copy_if(scale_copy_b, thr_tile_pSFB, filter_zeros(tSFBgSFB(_,_,_,*k_tile_iter)), filter_zeros(tSFBsSFB(_,_,_,mainloop_sf_pipe_producer_state.index())));
       mainloop_sf_pipeline.producer_commit(mainloop_sf_pipe_producer_state, cutlass::arch::cpasync_barrier_arrive_noinc);
+      GPU_TRACE_SCOPE_END(SF_LOAD_STAGE);
 
       __syncwarp();
 
@@ -950,6 +952,7 @@ struct CollectiveMma<
       --k_tile_count;
       ++k_tile_iter;
     }
+    RELEASE_GPU_TRACE;
 
     return cute::make_tuple(mainloop_sf_pipe_producer_state, k_tile_iter);
 
@@ -1006,8 +1009,7 @@ struct CollectiveMma<
     while (k_tile_count > 0) {
       // WAIT on mainloop_pipe_consumer_state until its data are available
       // (phase bit flips from mainloop_pipe_consumer_state.phase() value)
-      mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state);
-
+      mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state); // check is consumer and do barrier wait
       // Compute on k_tile
       int read_stage = mainloop_pipe_consumer_state.index();
       // Save current mainlop pipeline read state
@@ -1022,16 +1024,18 @@ struct CollectiveMma<
 
       CUTLASS_PRAGMA_UNROLL
       for (int scale_k_iter = 0; scale_k_iter < size<3>(tCrA); ++scale_k_iter) {
+
         accumulator_pipeline.producer_acquire(accumulator_pipe_producer_state);
 
         auto acc = slice_accumulator(accumulators, accumulator_pipe_producer_state.index());
         static_assert(is_tmem<remove_cvref_t<decltype(acc)>>::value, "Accumulator must be tmem resident.");
         static_assert(rank(remove_cvref_t<decltype(acc)>{}) == 3, "Accumulator must be MMA-partitioned: (MMA, MMA_M, MMA_N)");
+        
+        GPU_TRACE_SCOPE_BEGIN_DATA(MMA_PRODUCER_STAGE, accumulator_pipe_producer_state.index());
 
         // for each set of scale_k_iter we zero the accumulator
         tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
 
-        GPU_TRACE_SCOPE_BEGIN(MMA);
         // Unroll the K mode manually so we can set scale C to 1
         CUTLASS_PRAGMA_UNROLL
         for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
@@ -1042,9 +1046,10 @@ struct CollectiveMma<
                      acc);
           tiled_mma.accumulate_ = UMMA::ScaleOut::One;
         }
-        GPU_TRACE_SCOPE_END(MMA);
+        // async barrier, ask tensor core to 'set arrive' after it finish computation 
+        accumulator_pipeline.producer_commit(accumulator_pipe_producer_state); 
 
-        accumulator_pipeline.producer_commit(accumulator_pipe_producer_state);
+        GPU_TRACE_SCOPE_END(MMA_PRODUCER_STAGE);
         ++accumulator_pipe_producer_state;
       }
       mainloop_pipeline.consumer_release(curr_mainloop_pipe_consumer_state);
@@ -1142,6 +1147,8 @@ struct CollectiveMma<
     auto [accumulator_pipeline, mainloop_sf_pipeline] = pipelines;
     auto [accumulator_pipe_state, mainloop_sf_pipe_state] = consumer_states;
 
+    GET_GPU_TRACE(true);
+
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tile_count > 0) {
 
@@ -1164,6 +1171,7 @@ struct CollectiveMma<
       for (int k_block = 0; k_block < ScaleKsPerTile; ++k_block) {
 
         accumulator_pipeline.consumer_wait(accumulator_pipe_state);
+        GPU_TRACE_SCOPE_BEGIN_DATA(MMA_CONSUMER_STAGE, accumulator_pipe_state.index());
 
         Tensor acc = slice_accumulator(accumulators, accumulator_pipe_state.index());
         Tensor tAcc = acc(make_coord(_,_),_0{},_0{});
@@ -1192,6 +1200,7 @@ struct CollectiveMma<
         }
         cutlass::arch::fence_view_async_tmem_load();
         accumulator_pipeline.consumer_release(accumulator_pipe_state);
+        GPU_TRACE_SCOPE_END(MMA_CONSUMER_STAGE);
         // release acc
         ++accumulator_pipe_state;
       }
@@ -1199,6 +1208,7 @@ struct CollectiveMma<
       --k_tile_count;
     }
 
+    RELEASE_GPU_TRACE;
     return cute::make_tuple(tTR_FullAcc, tiled_t2r_epi, cute::make_tuple(accumulator_pipe_state, mainloop_sf_pipe_state));
  }
 

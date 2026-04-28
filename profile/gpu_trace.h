@@ -112,6 +112,8 @@ inline void teardown(GPUTraceParam&, S, const char* = nullptr) {}
 #define GPU_TRACE_SCOPE(name)
 #define GPU_TRACE_SCOPE_BEGIN(name)
 #define GPU_TRACE_SCOPE_END(name)
+#define GPU_TRACE_SCOPE_BEGIN_DATA(name, data_val)
+#define GPU_TRACE_PACK_DATA(k_remain, sub_iter) 0u
 
 #else /* GPU_TRACE_ENABLED */
 /* ===== Enabled ============================================================ */
@@ -290,6 +292,13 @@ struct ScopeGuard : Scope<ScopeId> {
 
 #define GPU_TRACE_SCOPE_END(name) _gtevt_##name.end(_gt_rec)
 
+#define GPU_TRACE_SCOPE_BEGIN_DATA(name, data_val)                \
+    gpu_trace::Scope<GTEVT_##name> _gtevt_##name(data_val);      \
+    _gtevt_##name.begin()
+
+#define GPU_TRACE_PACK_DATA(k_remain, sub_iter) \
+    (((uint32_t)(k_remain) << 16) | ((uint32_t)(sub_iter) & 0xFFFF))
+
 #endif /* __CUDACC__ */
 
 /* ---- Host-side helpers --------------------------------------------------- */
@@ -377,6 +386,7 @@ inline void teardown(GPUTraceParam& p,
         int tid;
         std::string name;
         int64_t tb, te;
+        uint32_t data;
     };
     std::vector<Rec> records;
     int64_t t_origin = INT64_MAX;
@@ -392,6 +402,7 @@ inline void teardown(GPUTraceParam& p,
             uint32_t begin_clk = h_buf[off + 0];
             uint32_t end_clk = h_buf[off + 1];
             uint32_t eid = h_buf[off + 2];
+            uint32_t data = h_buf[off + 3];
             if (begin_clk == 0 && end_clk == 0)
                 break;
 
@@ -399,7 +410,7 @@ inline void teardown(GPUTraceParam& p,
             int64_t tb = (int64_t)begin_clk;
             int64_t te = tb + dur;
 
-            records.push_back({t, detail::scope_label_for_id(eid), tb, te});
+            records.push_back({t, detail::scope_label_for_id(eid), tb, te, data});
             if (tb < t_origin)
                 t_origin = tb;
         }
@@ -476,9 +487,10 @@ inline void teardown(GPUTraceParam& p,
                          "{\"name\":\"%s\",\"ph\":\"X\","
                          "\"ts\":%.3f,\"dur\":%.3f,"
                          "\"pid\":%d,\"tid\":%d,"
-                         "\"args\":{\"cycles\":%lld}}",
+                         "\"args\":{\"cycles\":%lld,\"k_tile\":%u,\"sub_iter\":%u}}",
                          rec.name.c_str(), (double)(rec.tb - t_origin) * scale,
-                         (double)dur * scale, pid, lane, (long long)dur);
+                         (double)dur * scale, pid, lane, (long long)dur,
+                         (unsigned)(rec.data >> 16), (unsigned)(rec.data & 0xFFFF));
         }
     }
 

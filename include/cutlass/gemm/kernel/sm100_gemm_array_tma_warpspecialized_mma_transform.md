@@ -1,0 +1,1 @@
+gemm pipeline stage: compute a full output tile. The partial results should accumulate to the same `accum`.

@@ -367,7 +367,7 @@ int main(int argc, const char** argv) {
   int m_per_group = 256;
   int n = 2048;
   int k = 512;
-  int iterations = 10;
+  int iterations = 1;
 
   cmd.get_cmd_line_argument("num_groups", num_groups);
   cmd.get_cmd_line_argument("m_per_group", m_per_group);
@@ -453,11 +453,11 @@ int main(int argc, const char** argv) {
       /*masked_m=*/nullptr, m_per_group, n, k, num_groups, stream);
 
   // Warmup
-  for (int i = 0; i < 5; ++i) {
-    run_gemm_kernel(state, stream);
-  }
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-  std::cout << "Warmup done." << std::endl;
+//   for (int i = 0; i < 5; ++i) {
+//     run_gemm_kernel(state, stream);
+//   }
+//   CUDA_CHECK(cudaStreamSynchronize(stream));
+//   std::cout << "Warmup done." << std::endl;
 
   // GPU Trace: setup, run one traced iteration, teardown
   GPUTraceParam gt_param;
