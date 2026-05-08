@@ -113,6 +113,7 @@ inline void teardown(GPUTraceParam&, S, const char* = nullptr) {}
 #define GPU_TRACE_SCOPE_BEGIN(name)
 #define GPU_TRACE_SCOPE_END(name)
 #define GPU_TRACE_SCOPE_BEGIN_DATA(name, data_val)
+#define GPU_TRACE_MARK(name)
 #define GPU_TRACE_PACK_DATA(k_remain, sub_iter) 0u
 
 #else /* GPU_TRACE_ENABLED */
@@ -295,6 +296,12 @@ struct ScopeGuard : Scope<ScopeId> {
 #define GPU_TRACE_SCOPE_BEGIN_DATA(name, data_val)                \
     gpu_trace::Scope<GTEVT_##name> _gtevt_##name(data_val);      \
     _gtevt_##name.begin()
+
+#define GPU_TRACE_MARK(name)                                             \
+    {                                                                    \
+        uint32_t _gt_clk = gpu_trace::Scope<GTEVT_##name>::read_clock(); \
+        _gt_rec.write_v4(_gt_clk, _gt_clk, GTEVT_##name, 0u);          \
+    }
 
 #define GPU_TRACE_PACK_DATA(k_remain, sub_iter) \
     (((uint32_t)(k_remain) << 16) | ((uint32_t)(sub_iter) & 0xFFFF))

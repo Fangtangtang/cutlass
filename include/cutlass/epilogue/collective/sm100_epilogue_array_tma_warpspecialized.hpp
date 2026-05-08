@@ -132,7 +132,7 @@ public:
   // Epilog assumes a max scheduler pipe count to calculate the number of asynchronous tma update buffer they need.
   constexpr static uint32_t NumMaxSchedulerPipelineStageCount = 8;
 
-private:
+public:  // was private — exposed for flat kernel inlining (type aliases and constexpr only)
 
   constexpr static bool is_source_supported = not cute::is_void_v<ElementC>;
   constexpr static bool is_destination_supported = not cute::is_void_v<ElementD>;
