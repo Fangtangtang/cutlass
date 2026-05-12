@@ -62,8 +62,13 @@ GPU_TRACE=0 ./grouped_fp8_blockwise_flat --num_groups=256 --m_per_group=256 --n=
 GPU_TRACE_SCOPE_DEC(gemm_outer);
 GPU_TRACE_SCOPE_DEC(load_ab_consumed);
 GPU_TRACE_SCOPE_DEC(load_ab_ready);
-GPU_TRACE_SCOPE_DEC(epilogue_compute);
-GPU_TRACE_SCOPE_DEC(epilogue_outer);
+GPU_TRACE_SCOPE_DEC(start_load_sf);
+GPU_TRACE_SCOPE_DEC(ready_to_gemm);
+GPU_TRACE_SCOPE_DEC(wait_accumulator_ready);
+GPU_TRACE_SCOPE_DEC(accumulator_released);
+GPU_TRACE_SCOPE_DEC(accumulator_release);
+GPU_TRACE_SCOPE_DEC(wait_sf);
+// GPU_TRACE_SCOPE_DEC(epilogue_outer);
 GPU_TRACE_SCOPE_DEC(epilogue_outer_end);
 
 #include <cassert>
@@ -630,6 +635,7 @@ operator()(KernelParams const& params, char* smem_buf) {
         CUTLASS_PRAGMA_NO_UNROLL
         while (ab_count > 0) {
           mainloop_ab_pipeline.producer_acquire(mainloop_ab_pipe_producer_state, barrier_token);
+          GPU_TRACE_MARK(load_ab_consumed);
           using BarrierType = typename MainloopABPipeline::ProducerBarrierType;
           BarrierType* tma_barrier = mainloop_ab_pipeline.producer_get_barrier(mainloop_ab_pipe_producer_state);
           int write_stage = mainloop_ab_pipe_producer_state.index();
@@ -701,6 +707,7 @@ operator()(KernelParams const& params, char* smem_buf) {
     const ML_TMA_A* tma_load_a_sf = &params.mainloop.tma_load_a;
     const int32_t mock_L = 1;
 
+    GET_GPU_TRACE(true);
     // -- Invariant SF setup (same for all groups) --
     ML_GmemTiledCopySFA scale_copy_a{};
     ML_GmemTiledCopySFB scale_copy_b{};
@@ -839,6 +846,7 @@ operator()(KernelParams const& params, char* smem_buf) {
       did_batch_change = curr_batch != idx2crd(work_tile_info.L_idx, size<4>(gA_mkl));
     } while (work_tile_info.is_valid());
 
+    RELEASE_GPU_TRACE;
     // -- load_sf_tail inlined --
     mainloop_sf_pipeline.producer_tail(mainloop_sf_pipe_producer_state);
   }
@@ -931,8 +939,10 @@ operator()(KernelParams const& params, char* smem_buf) {
 
           CUTLASS_PRAGMA_UNROLL
           for (int scale_k_iter = 0; scale_k_iter < size<3>(tCrA); ++scale_k_iter) { // 1
-            
+            GPU_TRACE_MARK(ready_to_gemm);
+            // ! stall point
             accumulator_pipeline.producer_acquire(accumulator_pipe_producer_state);
+            GPU_TRACE_MARK(wait_accumulator_ready);
             auto acc = accumulators(_,_,_,accumulator_pipe_producer_state.index());
 
             tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
@@ -1102,15 +1112,15 @@ operator()(KernelParams const& params, char* smem_buf) {
 
       clear(tTR_FullAcc);
 
-      GPU_TRACE_MARK(epilogue_outer);
+      // GPU_TRACE_MARK(epilogue_outer);
       CUTLASS_PRAGMA_NO_UNROLL
       while (k_tile_count > 0) {
 
+        GPU_TRACE_MARK(wait_sf);
         mainloop_sf_pipeline.consumer_wait(mainloop_sf_pipe_consumer_state);
         int read_idx = mainloop_sf_pipe_consumer_state.index();
 
-        GPU_TRACE_MARK(epilogue_compute);
-        // copy from smem to register (computation happens in Cuda Core)
+        // synchronous copy from smem to register (computation happens in Cuda Core)
         copy(filter_zeros(tTR_sSFA_epi_part(_,_,_,_,_,_,read_idx)), tTR_rSFA_compact);
         copy(filter_zeros(tTR_sSFB_epi_part(_,_,_,_,_,_,read_idx)), tTR_rSFB_compact);
 
@@ -1121,10 +1131,10 @@ operator()(KernelParams const& params, char* smem_buf) {
         ++mainloop_sf_pipe_consumer_state;
 
         CUTLASS_PRAGMA_UNROLL
-        for (int k_block = 0; k_block < ML_ScaleKsPerTile; ++k_block) {
+        for (int k_block = 0; k_block < ML_ScaleKsPerTile; ++k_block) { // 1
 
           accumulator_pipeline.consumer_wait(accumulator_pipe_consumer_state);
-
+          GPU_TRACE_MARK(accumulator_released);
           Tensor acc_k = accumulators(_,_,_,accumulator_pipe_consumer_state.index());
           Tensor tAcc_k = acc_k(make_coord(_,_),_0{},_0{});
           Tensor tAcc_k_epi = flat_divide(tAcc_k, EpilogueTile{});
@@ -1150,13 +1160,14 @@ operator()(KernelParams const& params, char* smem_buf) {
             }
           }
           cutlass::arch::fence_view_async_tmem_load();
+          GPU_TRACE_MARK(accumulator_release);
+
           accumulator_pipeline.consumer_release(accumulator_pipe_consumer_state);
           ++accumulator_pipe_consumer_state;
         }
 
         --k_tile_count;
       }
-      GPU_TRACE_MARK(epilogue_outer_end);
 
       // -- tensormaps_fence_acquire<false> inlined --
       if (did_batch_change && warp_idx_in_epi == 0) {
@@ -1248,6 +1259,7 @@ operator()(KernelParams const& params, char* smem_buf) {
           cutlass::arch::NamedBarrier::sync(EPI_ThreadCount, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         };
 
+        GPU_TRACE_MARK(epilogue_outer_end);
         bool issue_tma_store = warp_idx_epi == 0;
 
         // tma_store_fn lambda (DelayTmaStore=false, ReuseSmemC=false)
@@ -1338,6 +1350,8 @@ operator()(KernelParams const& params, char* smem_buf) {
       }
 
       do_tail_store |= TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
+
+      GPU_TRACE_MARK(epilogue_outer_end);
 
       work_tile_info = next_work;
       cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
